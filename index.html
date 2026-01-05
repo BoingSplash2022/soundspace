@@ -641,11 +641,11 @@
         <div class="synth-section">
             <!-- Basic Synth Panel -->
             <div class="synth-panel">
-                <div class="synth-header active" id="basicSynthHeader">
+                <div class="synth-header" id="basicSynthHeader">
                     <h2>🎹 Basic Synth</h2>
                     <span class="arrow">▼</span>
                 </div>
-                <div class="synth-content active" id="basicSynthContent">
+                <div class="synth-content" id="basicSynthContent">
                     <!-- Basic Synth controls will be inserted here by JavaScript -->
                 </div>
             </div>
@@ -687,9 +687,9 @@
                 <div style="flex: 1;"></div>
 
                 <div class="transport-controls">
-                    <button class="transport-btn" id="saveBtn" title="Save">💾</button>
-                    <button class="transport-btn" id="loadBtn" title="Load">📂</button>
-                    <button class="transport-btn" id="exportBtn" title="Export">⬇️</button>
+                    <button class="transport-btn" id="saveBtn" title="Save Project (JSON)">💾</button>
+                    <button class="transport-btn" id="loadBtn" title="Load Project">📂</button>
+                    <button class="transport-btn" id="exportBtn" title="Export Audio (Record)">⬇️</button>
                 </div>
             </div>
 
@@ -741,6 +741,28 @@
             <div class="modal-buttons">
                 <button class="modal-btn secondary" id="cancelTrackBtn">Cancel</button>
                 <button class="modal-btn primary" id="confirmTrackBtn">Add Track</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Audio Modal -->
+    <div class="modal" id="exportModal">
+        <div class="modal-content">
+            <h2 class="modal-title">Export Audio as WAV</h2>
+            <div style="margin-bottom: 20px; padding: 15px; background: rgba(102, 126, 234, 0.1); border-radius: 8px; font-size: 0.9em; line-height: 1.6;">
+                <strong style="color: #ffb347;">How it works:</strong><br>
+                • Click "Start Export"<br>
+                • Your arrangement will be rendered offline (fast!)<br>
+                • Download begins automatically as high-quality WAV<br>
+                • No conversion needed - ready to use!<br><br>
+                <strong style="color: #a0a0ff;">WAV Format:</strong><br>
+                ✅ Uncompressed, lossless quality<br>
+                ✅ Works in all audio software<br>
+                ✅ Professional studio standard
+            </div>
+            <div class="modal-buttons">
+                <button class="modal-btn secondary" onclick="hideExportModal()">Cancel</button>
+                <button class="modal-btn primary" onclick="startAudioExport()">Start Export</button>
             </div>
         </div>
     </div>
@@ -804,6 +826,11 @@
             chorus: 0.5,
             reverb: 0.4
         };
+
+        // Audio recording
+        let mediaRecorder;
+        let audioChunks = [];
+        let recordingDestination;
 
         // Audio sample storage
         const audioSamples = new Map(); // Map track ID to audio buffer
@@ -1557,6 +1584,14 @@
             document.getElementById('recordBtn').classList.remove('active');
             clearInterval(schedulerInterval);
             
+            // Stop audio export if recording
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                document.getElementById('exportBtn').textContent = '⬇️';
+                document.getElementById('exportBtn').style.background = 'rgba(255, 255, 255, 0.1)';
+                document.getElementById('exportBtn').style.animation = '';
+            }
+            
             updatePositionDisplay();
             updatePlayheadPosition();
         }
@@ -2290,7 +2325,321 @@
         }
 
         function exportAudio() {
-            alert('Audio Export\n\nUse system audio recorder:\n1. Set to record "System Audio"\n2. Press Play in DAW\n3. Start recording\n4. Let track play\n5. Stop and save');
+            document.getElementById('exportModal').classList.add('active');
+            document.getElementById('modalOverlay').classList.add('active');
+        }
+
+        function hideExportModal() {
+            document.getElementById('exportModal').classList.remove('active');
+            document.getElementById('modalOverlay').classList.remove('active');
+        }
+
+        function startAudioExport() {
+            hideExportModal();
+            
+            // Check if there's anything to record
+            if (sequencer.tracks.length === 0) {
+                alert('No tracks to export! Add some tracks first.');
+                return;
+            }
+            
+            // Show progress
+            const exportBtn = document.getElementById('exportBtn');
+            exportBtn.textContent = '⏳';
+            exportBtn.style.background = '#ffb347';
+            exportBtn.style.animation = 'pulse 1s infinite';
+            
+            // Calculate total duration in beats
+            let maxBeat = 0;
+            sequencer.tracks.forEach(track => {
+                if (track.notes) {
+                    track.notes.forEach(note => {
+                        const endBeat = (note.position / 25) + (note.duration * 4); // Convert to beats
+                        maxBeat = Math.max(maxBeat, endBeat);
+                    });
+                }
+                if (track.audioBlocks) {
+                    track.audioBlocks.forEach(block => {
+                        const endBeat = (block.position / 25) + (block.duration * sequencer.bpm / 60);
+                        maxBeat = Math.max(maxBeat, endBeat);
+                    });
+                }
+            });
+            
+            // Default to 64 bars if no notes
+            if (maxBeat === 0) maxBeat = 256;
+            
+            const duration = (maxBeat / 4) * (60.0 / sequencer.bpm); // Duration in seconds
+            const sampleRate = audioContext.sampleRate;
+            const numberOfChannels = 2;
+            
+            // Create offline context for rendering
+            const offlineContext = new OfflineAudioContext(numberOfChannels, sampleRate * duration, sampleRate);
+            
+            // Create master gain for offline context
+            const offlineMasterGain = offlineContext.createGain();
+            offlineMasterGain.gain.value = 0.8;
+            offlineMasterGain.connect(offlineContext.destination);
+            
+            // Render all tracks
+            let currentTime = 0;
+            for (let beat = 0; beat < maxBeat; beat++) {
+                const time = (beat / 4) * (60.0 / sequencer.bpm);
+                
+                sequencer.tracks.forEach(track => {
+                    if (track.muted) return;
+                    const hasSolo = sequencer.tracks.some(t => t.solo);
+                    if (hasSolo && !track.solo) return;
+                    
+                    if (track.instrument === 'audio-sample') {
+                        if (track.audioBlocks) {
+                            track.audioBlocks.forEach(block => {
+                                if (Math.floor(block.position / 25) === beat) {
+                                    renderAudioSampleOffline(offlineContext, offlineMasterGain, track.id, time, track.volume || 0.8);
+                                }
+                            });
+                        }
+                    } else if (track.notes) {
+                        track.notes.forEach(note => {
+                            if (Math.floor(note.position / 25) === beat) {
+                                if (track.instrument === 'basic-synth') {
+                                    renderBasicNoteOffline(offlineContext, offlineMasterGain, note.frequency, time, note.duration, track.volume || 0.8);
+                                } else if (track.instrument === 'strings') {
+                                    renderStringsNoteOffline(offlineContext, offlineMasterGain, note.frequency, time, note.duration, track.volume || 0.8);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            
+            // Render the audio
+            offlineContext.startRendering().then((renderedBuffer) => {
+                // Convert to WAV
+                const wav = audioBufferToWav(renderedBuffer);
+                const blob = new Blob([wav], { type: 'audio/wav' });
+                const url = URL.createObjectURL(blob);
+                
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `soundspace-export-${Date.now()}.wav`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                
+                // Reset button
+                exportBtn.textContent = '⬇️';
+                exportBtn.style.background = 'rgba(255, 255, 255, 0.1)';
+                exportBtn.style.animation = '';
+                
+                alert('Audio exported as WAV! High quality, uncompressed audio file ready to use.');
+            }).catch((error) => {
+                console.error('Export error:', error);
+                exportBtn.textContent = '⬇️';
+                exportBtn.style.background = 'rgba(255, 255, 255, 0.1)';
+                exportBtn.style.animation = '';
+                alert('Export failed. Please try again.');
+            });
+        }
+
+        // Offline rendering functions for each synth type
+        function renderBasicNoteOffline(offlineContext, destination, frequency, time, duration, trackVolume) {
+            const oscillators = [];
+            const oscillatorGains = [];
+            
+            if (basicSynthParams.harmonicsEnabled) {
+                const harmonics = [
+                    { mult: 1.0, gain: 1.0 },
+                    { mult: 2.0, gain: 0.5 },
+                    { mult: 3.0, gain: 0.33 },
+                    { mult: 4.0, gain: 0.25 }
+                ];
+                
+                harmonics.forEach((harmonic) => {
+                    const osc = offlineContext.createOscillator();
+                    osc.type = basicSynthParams.waveform;
+                    osc.frequency.value = frequency * harmonic.mult;
+                    
+                    const oscGain = offlineContext.createGain();
+                    oscGain.gain.value = harmonic.gain * basicSynthParams.harmonicsAmount * 0.3;
+                    
+                    osc.connect(oscGain);
+                    oscillators.push(osc);
+                    oscillatorGains.push(oscGain);
+                });
+            } else {
+                const osc = offlineContext.createOscillator();
+                osc.type = basicSynthParams.waveform;
+                osc.frequency.value = frequency;
+                
+                const oscGain = offlineContext.createGain();
+                oscGain.gain.value = 1.0;
+                
+                osc.connect(oscGain);
+                oscillators.push(osc);
+                oscillatorGains.push(oscGain);
+            }
+            
+            const filter = offlineContext.createBiquadFilter();
+            filter.type = basicSynthParams.filterType;
+            filter.frequency.value = basicSynthParams.cutoff;
+            filter.Q.value = basicSynthParams.resonance;
+            
+            const gain = offlineContext.createGain();
+            gain.gain.value = 0;
+            
+            oscillatorGains.forEach(oscGain => oscGain.connect(filter));
+            filter.connect(gain);
+            gain.connect(destination);
+            
+            const durationSeconds = duration * (60.0 / sequencer.bpm);
+            const effectiveVolume = basicSynthParams.volume * trackVolume;
+            
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(effectiveVolume, time + basicSynthParams.attack);
+            gain.gain.linearRampToValueAtTime(
+                effectiveVolume * basicSynthParams.sustain,
+                time + basicSynthParams.attack + basicSynthParams.decay
+            );
+            gain.gain.setValueAtTime(
+                effectiveVolume * basicSynthParams.sustain,
+                time + durationSeconds
+            );
+            gain.gain.linearRampToValueAtTime(0, time + durationSeconds + basicSynthParams.release);
+            
+            oscillators.forEach(osc => {
+                osc.start(time);
+                osc.stop(time + durationSeconds + basicSynthParams.release);
+            });
+        }
+
+        function renderStringsNoteOffline(offlineContext, destination, frequency, time, duration, trackVolume) {
+            const voices = [];
+            const harmonics = [
+                { mult: 1.0, gain: 1.0 },
+                { mult: 2.0, gain: 0.5 },
+                { mult: 3.0, gain: 0.33 },
+                { mult: 4.0, gain: 0.25 },
+                { mult: 5.0, gain: 0.2 }
+            ];
+            
+            const detunes = [-stringsSynthParams.chorus * 10, 0, stringsSynthParams.chorus * 10];
+            
+            detunes.forEach((detune) => {
+                harmonics.forEach((harmonic, idx) => {
+                    const osc = offlineContext.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.value = frequency * harmonic.mult;
+                    osc.detune.value = detune;
+                    
+                    const gain = offlineContext.createGain();
+                    const brightnessAdjust = Math.pow(stringsSynthParams.brightness, idx);
+                    gain.gain.value = harmonic.gain * brightnessAdjust * stringsSynthParams.richness * 0.15;
+                    
+                    osc.connect(gain);
+                    voices.push({ osc, gain });
+                });
+            });
+            
+            const filter = offlineContext.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.value = 800 + (stringsSynthParams.brightness * 4000);
+            
+            const mainGain = offlineContext.createGain();
+            mainGain.gain.value = 0;
+            
+            voices.forEach(({ osc, gain }) => {
+                gain.connect(filter);
+            });
+            
+            filter.connect(mainGain);
+            mainGain.connect(destination);
+            
+            const durationSeconds = duration * (60.0 / sequencer.bpm);
+            const effectiveVolume = stringsSynthParams.volume * trackVolume;
+            
+            mainGain.gain.setValueAtTime(0, time);
+            mainGain.gain.linearRampToValueAtTime(effectiveVolume, time + stringsSynthParams.attack);
+            mainGain.gain.setValueAtTime(effectiveVolume, time + stringsSynthParams.attack + 0.1);
+            mainGain.gain.setValueAtTime(effectiveVolume, time + durationSeconds);
+            mainGain.gain.linearRampToValueAtTime(0, time + durationSeconds + stringsSynthParams.release);
+            
+            voices.forEach(({ osc }) => {
+                osc.start(time);
+                osc.stop(time + durationSeconds + stringsSynthParams.release);
+            });
+        }
+
+        function renderAudioSampleOffline(offlineContext, destination, trackId, time, trackVolume) {
+            const buffer = audioSamples.get(trackId);
+            
+            if (buffer) {
+                const source = offlineContext.createBufferSource();
+                source.buffer = buffer;
+                
+                const gainNode = offlineContext.createGain();
+                gainNode.gain.value = trackVolume;
+                
+                source.connect(gainNode);
+                gainNode.connect(destination);
+                
+                source.start(time);
+            }
+        }
+
+        // Convert AudioBuffer to WAV format
+        function audioBufferToWav(buffer) {
+            const length = buffer.length * buffer.numberOfChannels * 2 + 44;
+            const arrayBuffer = new ArrayBuffer(length);
+            const view = new DataView(arrayBuffer);
+            const channels = [];
+            let offset = 0;
+            let pos = 0;
+            
+            // Write WAVE header
+            setUint32(0x46464952); // "RIFF"
+            setUint32(length - 8); // file length - 8
+            setUint32(0x45564157); // "WAVE"
+            
+            setUint32(0x20746d66); // "fmt " chunk
+            setUint32(16); // length = 16
+            setUint16(1); // PCM (uncompressed)
+            setUint16(buffer.numberOfChannels);
+            setUint32(buffer.sampleRate);
+            setUint32(buffer.sampleRate * 2 * buffer.numberOfChannels); // avg. bytes/sec
+            setUint16(buffer.numberOfChannels * 2); // block-align
+            setUint16(16); // 16-bit (hardcoded)
+            
+            setUint32(0x61746164); // "data" - chunk
+            setUint32(length - pos - 4); // chunk length
+            
+            // Write interleaved data
+            for (let i = 0; i < buffer.numberOfChannels; i++) {
+                channels.push(buffer.getChannelData(i));
+            }
+            
+            while (pos < length) {
+                for (let i = 0; i < buffer.numberOfChannels; i++) {
+                    let sample = Math.max(-1, Math.min(1, channels[i][offset]));
+                    sample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                    view.setInt16(pos, sample, true);
+                    pos += 2;
+                }
+                offset++;
+            }
+            
+            return arrayBuffer;
+            
+            function setUint16(data) {
+                view.setUint16(pos, data, true);
+                pos += 2;
+            }
+            
+            function setUint32(data) {
+                view.setUint32(pos, data, true);
+                pos += 4;
+            }
         }
 
         // Initialize on load
